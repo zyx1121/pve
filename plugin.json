@@ -1,0 +1,33 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "pve",
+  "version": "0.1.0",
+  "description": "Proxmox and gateway operations through MCP: guests, port forwards, internal DNS, and Caddy.",
+  "author": {
+    "name": "zyx1121",
+    "url": "https://github.com/zyx1121"
+  },
+  "repository": "https://github.com/zyx1121/pve",
+  "license": "MIT",
+  "keywords": [
+    "proxmox",
+    "pve",
+    "mcp",
+    "codex",
+    "claude-code"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "PVE",
+        "shortDescription": "Operate Proxmox and gateway services",
+        "developerName": "zyx1121",
+        "category": "Developer Tools",
+        "capabilities": [
+          "Read",
+          "Write"
+        ]
+      }
+    }
+  }
+}

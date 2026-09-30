@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "host": "pve",
+  "gateway": "gateway",
+  "template": 9000,
+  "gateway_ip": "192.0.2.1",
+  "gateway_dns": "/srv/gateway/dns/hosts",
+  "gateway_caddy": "/srv/gateway/Caddyfile",
+  "gateway_env": "/srv/gateway/.env",
+  "caddy_reload": "sudo systemctl reload caddy",
+  "bridge": "vmbr1",
+  "fw_group": "spoke",
+  "ct_template": "local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst",
+  "debian_mirror": "https://deb.debian.org/debian"
+}
