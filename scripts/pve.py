@@ -351,7 +351,9 @@ _HOSTNAME_RE = re.compile(
 
 def _valid_dns_host(host: str) -> str:
     """Reject anything but a plain hostname; it ends up in remote shell commands."""
-    if not _HOSTNAME_RE.match(host):
+    # fullmatch: with match(), "$" also accepts a trailing newline, which split
+    # the grep pattern in two and matched every line of the hosts file.
+    if not _HOSTNAME_RE.fullmatch(host):
         fail("invalid hostname", why=f"{host!r} is not a DNS hostname",
              hint="use letters, digits, hyphens and dots, e.g. sandbox.internal")
     return host
@@ -449,21 +451,26 @@ def _remove_dns_record(host: str) -> bool:
     return True
 
 
+def _parse_dns_records(text: str) -> list[dict]:
+    """`ip host` records of a hosts file, comments and blank lines skipped."""
+    records: list[dict] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) >= 2:
+            records.append({"ip": parts[0], "host": parts[1]})
+    return records
+
+
 def _find_dns_records_by_ip(vm_ip: str) -> list[dict]:
     """Records on gateway dnsmasq whose first column matches vm_ip."""
     try:
         out = ssh_run(GATEWAY_HOST, "cat", GATEWAY_DNS_HOSTS)
     except SystemExit:
         return []
-    records: list[dict] = []
-    for raw in out.splitlines():
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        parts = stripped.split()
-        if len(parts) >= 2 and parts[0] == vm_ip:
-            records.append({"ip": parts[0], "host": parts[1]})
-    return records
+    return [r for r in _parse_dns_records(out) if r["ip"] == vm_ip]
 
 
 _CADDY_FIND_BY_IP_SCRIPT = """
@@ -740,7 +747,8 @@ def destroy(
         if not served:
             dns_warning = f"dnsmasq does not read {GATEWAY_DNS_HOSTS}; its answers did not change"
         else:
-            still = [h for h in dns_removed if _dnsmasq_answer(h, listen)]
+            still = [r["host"] for r in dns_records if r["host"] in dns_removed
+                     and r["ip"] in (_dnsmasq_answer(r["host"], listen) or [])]
             if still:
                 dns_warning = f"still served after reloading dnsmasq: {', '.join(still)}"
 
@@ -1112,15 +1120,7 @@ def dns(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ) -> None:
     if action == "list":
-        out = ssh_run(GATEWAY_HOST, "cat", GATEWAY_DNS_HOSTS)
-        records = []
-        for line in out.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            parts = stripped.split()
-            if len(parts) >= 2:
-                records.append({"ip": parts[0], "host": parts[1]})
+        records = _parse_dns_records(ssh_run(GATEWAY_HOST, "cat", GATEWAY_DNS_HOSTS))
         served, _ = _dnsmasq_config()
         emit({"records": records, "hosts_file": GATEWAY_DNS_HOSTS, "served": served})
         return
@@ -1133,14 +1133,19 @@ def dns(
         if not yes and not typer.confirm(f"remove DNS record for {host!r}?"):
             fail("aborted", why="user did not confirm", hint="pass --yes to skip")
         listen = _require_served()
+        old_ips = [r["ip"] for r in _parse_dns_records(ssh_run(GATEWAY_HOST, "cat", GATEWAY_DNS_HOSTS))
+                   if r["host"] == host]
         if not _remove_dns_record(host):
             emit({"host": host, "action": "skipped", "reason": "not in hosts file"})
             return
         _dnsmasq_reload()
         answer = _dnsmasq_answer(host, listen)
-        if answer:
+        # Only the removed addresses count: an overridden public name still
+        # resolves upstream after its record is gone.
+        still = [ip for ip in old_ips if ip in (answer or [])]
+        if still:
             fail("record removed from the hosts file but still served",
-                 why=f"dig @{listen} {host} returned {', '.join(answer)} after reloading dnsmasq",
+                 why=f"dig @{listen} {host} returned {', '.join(still)} after reloading dnsmasq",
                  hint="another addn-hosts file on the gateway still lists the name")
         emit({"host": host, "action": "removed", "verified": answer is not None})
         return

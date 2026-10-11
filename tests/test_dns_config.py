@@ -75,10 +75,15 @@ def refused(host: str) -> bool:
 
 check("plain and dotted hostnames pass",
       not refused("sandbox") and not refused("spawner.internal") and not refused("a-1.b2.internal"))
-for bad in ["x';id;'", "a b", "$(id)", "a;b", "-x", "a..b", "", "a" * 64]:
+for bad in ["x';id;'", "a b", "$(id)", "a;b", "-x", "a..b", "", "a" * 64,
+            "sandbox.internal\n", "a\nb", "a\t"]:
     check(f"hostname {bad[:20]!r} is refused", refused(bad))
 check("the field pattern is one shell word matching dots literally",
       pve._host_field_pattern("a.b") == "'[[:space:]]a[.]b([[:space:]]|$)'")
+
+check("hosts-file records skip comments and blank lines",
+      pve._parse_dns_records("# c\n\n10.0.0.1 a.internal\n  10.0.0.2   b  \n") ==
+      [{"ip": "10.0.0.1", "host": "a.internal"}, {"ip": "10.0.0.2", "host": "b"}])
 
 # dig output: ";;" lines are dig's own errors, not answers.
 def answer(out: str):
