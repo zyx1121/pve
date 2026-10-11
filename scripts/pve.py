@@ -343,24 +343,54 @@ def _dnsmasq_reload() -> None:
 
 _DNSMASQ_CONF = "/etc/dnsmasq.conf /etc/dnsmasq.d/*"
 
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+)
+
+
+def _valid_dns_host(host: str) -> str:
+    """Reject anything but a plain hostname; it ends up in remote shell commands."""
+    if not _HOSTNAME_RE.match(host):
+        fail("invalid hostname", why=f"{host!r} is not a DNS hostname",
+             hint="use letters, digits, hyphens and dots, e.g. sandbox.internal")
+    return host
+
+
+def _host_field_pattern(host: str) -> str:
+    """Shell-quoted ERE matching host as a whole field of a hosts-file line."""
+    return shlex.quote(f"[[:space:]]{host.replace('.', '[.]')}([[:space:]]|$)")
+
 
 def _parse_dnsmasq_config(text: str, hosts_file: str) -> tuple[bool, Optional[str]]:
     """From dnsmasq config lines: whether addn-hosts covers hosts_file (the file
-    itself or its directory), and the first listen address."""
-    served, listen = False, None
+    itself or its directory), and the first listen address. A `managed=` line
+    gives hosts_file with symlinks resolved, like the addn-hosts values."""
+    paths, listen = [], None
     for line in text.splitlines():
         key, _, value = line.strip().partition("=")
         value = value.strip().rstrip("/")
-        if key == "addn-hosts" and value in (hosts_file, os.path.dirname(hosts_file)):
-            served = True
+        if key == "addn-hosts" and value:
+            paths.append(value)
         elif key == "listen-address" and listen is None and value:
             listen = value.split(",")[0].strip()
+        elif key == "managed" and value:
+            hosts_file = value
+    served = any(p in (hosts_file, os.path.dirname(hosts_file)) for p in paths)
     return served, listen
 
 
 def _dnsmasq_config() -> tuple[bool, Optional[str]]:
+    # Skip the files dnsmasq's conf-dir skips; resolve symlinks on both sides.
+    managed = shlex.quote(GATEWAY_DNS_HOSTS)
     out = ssh_run(GATEWAY_HOST, "sh", "-c",
-                  f"cat {_DNSMASQ_CONF} 2>/dev/null | grep -E '^(addn-hosts|listen-address)=' || true")
+                  f"for f in {_DNSMASQ_CONF}; do "
+                  "case \"$f\" in *.dpkg-*|*~|*/README) continue;; esac; "
+                  "[ -f \"$f\" ] && grep -hE '^(addn-hosts|listen-address)=' \"$f\"; "
+                  "done | while IFS='=' read -r k v; do "
+                  "if [ \"$k\" = addn-hosts ]; then echo \"addn-hosts=$(readlink -f \"$v\" || echo \"$v\")\"; "
+                  "else echo \"$k=$v\"; fi; done; "
+                  f"echo \"managed=$(readlink -f {managed} || echo {managed})\"")
     return _parse_dnsmasq_config(out, GATEWAY_DNS_HOSTS)
 
 
@@ -385,9 +415,10 @@ def _dnsmasq_answer(host: str, listen: Optional[str]) -> Optional[list[str]]:
                   f"command -v dig >/dev/null || exit 0; "
                   f"dig +short @{shlex.quote(listen)} {shlex.quote(host)} A; echo __end")
     lines = [l.strip() for l in out.splitlines() if l.strip()]
-    if "__end" not in lines:
+    # ";;" lines are dig's own errors (timeout, no servers): nothing was answered.
+    if "__end" not in lines or any(l.startswith(";;") for l in lines):
         return None
-    return [l for l in lines if l != "__end"]
+    return [l for l in lines if l != "__end" and not l.startswith(";")]
 
 
 def _run_remote_python(host: str, script: str, *args: str) -> str:
@@ -403,20 +434,16 @@ def _run_remote_python(host: str, script: str, *args: str) -> str:
 def _remove_dns_record(host: str) -> bool:
     """Remove a *.internal record from gateway dnsmasq hosts file by hostname.
     Returns True if the record was present and removed. Caller reloads dnsmasq."""
-    check_cmd = (
-        f"grep -qE '[[:space:]]{re.escape(host)}([[:space:]]|$)' "
-        f"{shlex.quote(GATEWAY_DNS_HOSTS)} && echo present || echo absent"
-    )
+    pattern, hosts = _host_field_pattern(host), shlex.quote(GATEWAY_DNS_HOSTS)
+    check_cmd = f"grep -qE {pattern} {hosts} && echo present || echo absent"
     if ssh_run(GATEWAY_HOST, "sh", "-c", check_cmd).strip() != "present":
         return False
-    # chmod 644 after mv: mktemp creates 600, but dnsmasq (drops to its own
-    # user) must be able to read the addn-hosts file. DNS records aren't secret.
+    # Write back in place: `mv tmp file` would turn a symlinked hosts file into
+    # a regular copy and keep its mode and owner only by accident.
     rewrite = (
         f"tmp=$(mktemp) && "
-        f"grep -vE '[[:space:]]{re.escape(host)}([[:space:]]|$)' "
-        f"{shlex.quote(GATEWAY_DNS_HOSTS)} > $tmp && "
-        f"mv $tmp {shlex.quote(GATEWAY_DNS_HOSTS)} && "
-        f"chmod 644 {shlex.quote(GATEWAY_DNS_HOSTS)}"
+        f"{{ grep -vE {pattern} {hosts} || [ $? -eq 1 ]; }} > \"$tmp\" && "
+        f"cat \"$tmp\" > {hosts}; rc=$?; rm -f \"$tmp\"; exit $rc"
     )
     ssh_run(GATEWAY_HOST, "sh", "-c", rewrite)
     return True
@@ -701,11 +728,21 @@ def destroy(
         _persist_iptables()
 
     dns_removed: list[str] = []
-    for r in dns_records:
-        if _remove_dns_record(r["host"]):
-            dns_removed.append(r["host"])
-    if dns_removed:
-        _dnsmasq_reload()
+    dns_warning: Optional[str] = None
+    if dns_records:
+        # The guest is already gone, so report DNS trouble instead of failing.
+        served, listen = _dnsmasq_config()
+        for r in dns_records:
+            if _remove_dns_record(r["host"]):
+                dns_removed.append(r["host"])
+        if dns_removed:
+            _dnsmasq_reload()
+        if not served:
+            dns_warning = f"dnsmasq does not read {GATEWAY_DNS_HOSTS}; its answers did not change"
+        else:
+            still = [h for h in dns_removed if _dnsmasq_answer(h, listen)]
+            if still:
+                dns_warning = f"still served after reloading dnsmasq: {', '.join(still)}"
 
     caddy_removed: list[str] = []
     for domain in caddy_domains:
@@ -734,6 +771,7 @@ def destroy(
         "action": "destroy",
         "forwards_removed": forwards_removed,
         "dns_removed": dns_removed,
+        **({"dns_warning": dns_warning} if dns_warning else {}),
         "caddy_removed": caddy_removed,
         "firewall_removed": firewall_removed,
         "ssh_alias_removed": ssh_alias_result.get("changed", False),
@@ -1089,6 +1127,7 @@ def dns(
 
     if not host:
         fail("host required", hint="pass host to pve_add_dns or pve_remove_dns")
+    _valid_dns_host(host)
 
     if action == "remove":
         if not yes and not typer.confirm(f"remove DNS record for {host!r}?"):
@@ -1112,13 +1151,18 @@ def dns(
     # add (existing behavior)
     if not ip:
         fail("ip required for add", hint="pass host and ip to pve_add_dns")
-    check_cmd = f"grep -qE '\\\\b{re.escape(host)}\\\\b' {shlex.quote(GATEWAY_DNS_HOSTS)} && echo present || echo absent"
+    try:
+        ip = str(ipaddress.ip_address(ip))
+    except ValueError:
+        fail("invalid ip", why=f"{ip!r} is not an IP address", hint="pass an address such as 10.10.10.104")
+    listen = _require_served()
+    check_cmd = (f"grep -qE {_host_field_pattern(host)} {shlex.quote(GATEWAY_DNS_HOSTS)} "
+                 "&& echo present || echo absent")
     present = ssh_run(GATEWAY_HOST, "sh", "-c", check_cmd).strip()
     if present == "present":
         emit({"host": host, "ip": ip, "action": "skipped", "reason": "already in hosts file"})
         return
 
-    listen = _require_served()
     plan = f"append `{ip} {host}` to {GATEWAY_DNS_HOSTS} on {GATEWAY_HOST} + reload dnsmasq"
     if dry_run:
         emit({"host": host, "ip": ip, "action": "dry-run", "plan": plan})
