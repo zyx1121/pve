@@ -202,6 +202,7 @@ export const pveTools: ToolboxTool[] = [
       z.looseObject({
         records: z.array(z.looseObject({ ip: z.string(), host: z.string() })),
         hosts_file: z.string().describe("Path of the hosts file on the gateway."),
+        served: z.boolean().describe("Whether the gateway's dnsmasq reads this hosts file; false means edits do not take effect."),
       }),
     ),
     annotations: read,

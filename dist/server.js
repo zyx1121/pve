@@ -35218,7 +35218,8 @@ var pveTools = [
     inputSchema: {},
     outputSchema: envelopeOutput(exports_external.looseObject({
       records: exports_external.array(exports_external.looseObject({ ip: exports_external.string(), host: exports_external.string() })),
-      hosts_file: exports_external.string().describe("Path of the hosts file on the gateway.")
+      hosts_file: exports_external.string().describe("Path of the hosts file on the gateway."),
+      served: exports_external.boolean().describe("Whether the gateway's dnsmasq reads this hosts file; false means edits do not take effect.")
     })),
     annotations: read,
     script,
@@ -35323,7 +35324,7 @@ var pveTools = [
 var plugin_default = {
   $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   name: "pve",
-  version: "0.1.0",
+  version: "0.1.1",
   description: "Proxmox and gateway operations through MCP: guests, port forwards, internal DNS, and Caddy.",
   author: {
     name: "zyx1121",
