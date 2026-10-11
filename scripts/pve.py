@@ -341,6 +341,55 @@ def _dnsmasq_reload() -> None:
     ssh_run(GATEWAY_HOST, "sudo", "systemctl", "reload", "dnsmasq")
 
 
+_DNSMASQ_CONF = "/etc/dnsmasq.conf /etc/dnsmasq.d/*"
+
+
+def _parse_dnsmasq_config(text: str, hosts_file: str) -> tuple[bool, Optional[str]]:
+    """From dnsmasq config lines: whether addn-hosts covers hosts_file (the file
+    itself or its directory), and the first listen address."""
+    served, listen = False, None
+    for line in text.splitlines():
+        key, _, value = line.strip().partition("=")
+        value = value.strip().rstrip("/")
+        if key == "addn-hosts" and value in (hosts_file, os.path.dirname(hosts_file)):
+            served = True
+        elif key == "listen-address" and listen is None and value:
+            listen = value.split(",")[0].strip()
+    return served, listen
+
+
+def _dnsmasq_config() -> tuple[bool, Optional[str]]:
+    out = ssh_run(GATEWAY_HOST, "sh", "-c",
+                  f"cat {_DNSMASQ_CONF} 2>/dev/null | grep -E '^(addn-hosts|listen-address)=' || true")
+    return _parse_dnsmasq_config(out, GATEWAY_DNS_HOSTS)
+
+
+def _require_served() -> Optional[str]:
+    """Fail before editing a hosts file dnsmasq does not read; return its listen address."""
+    served, listen = _dnsmasq_config()
+    if not served:
+        fail("dnsmasq does not read the managed hosts file",
+             why=f"no addn-hosts={GATEWAY_DNS_HOSTS} in {_DNSMASQ_CONF} on {GATEWAY_HOST}, "
+                 "so an edit would report success without changing what dnsmasq answers",
+             hint="point dnsmasq's addn-hosts at the gateway_dns path (or gateway_dns at the "
+                  "file dnsmasq reads) and restart dnsmasq")
+    return listen
+
+
+def _dnsmasq_answer(host: str, listen: Optional[str]) -> Optional[list[str]]:
+    """Addresses dnsmasq returns for host, or None when it cannot be asked
+    (no listen-address configured or no dig on the gateway)."""
+    if not listen:
+        return None
+    out = ssh_run(GATEWAY_HOST, "sh", "-c",
+                  f"command -v dig >/dev/null || exit 0; "
+                  f"dig +short @{shlex.quote(listen)} {shlex.quote(host)} A; echo __end")
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    if "__end" not in lines:
+        return None
+    return [l for l in lines if l != "__end"]
+
+
 def _run_remote_python(host: str, script: str, *args: str) -> str:
     """Run a Python script on a remote host via base64 to avoid quoting hell."""
     b64 = base64.b64encode(script.encode()).decode()
@@ -1034,7 +1083,8 @@ def dns(
             parts = stripped.split()
             if len(parts) >= 2:
                 records.append({"ip": parts[0], "host": parts[1]})
-        emit({"records": records, "hosts_file": GATEWAY_DNS_HOSTS})
+        served, _ = _dnsmasq_config()
+        emit({"records": records, "hosts_file": GATEWAY_DNS_HOSTS, "served": served})
         return
 
     if not host:
@@ -1043,11 +1093,17 @@ def dns(
     if action == "remove":
         if not yes and not typer.confirm(f"remove DNS record for {host!r}?"):
             fail("aborted", why="user did not confirm", hint="pass --yes to skip")
+        listen = _require_served()
         if not _remove_dns_record(host):
             emit({"host": host, "action": "skipped", "reason": "not in hosts file"})
             return
         _dnsmasq_reload()
-        emit({"host": host, "action": "removed"})
+        answer = _dnsmasq_answer(host, listen)
+        if answer:
+            fail("record removed from the hosts file but still served",
+                 why=f"dig @{listen} {host} returned {', '.join(answer)} after reloading dnsmasq",
+                 hint="another addn-hosts file on the gateway still lists the name")
+        emit({"host": host, "action": "removed", "verified": answer is not None})
         return
 
     if action != "add":
@@ -1062,6 +1118,7 @@ def dns(
         emit({"host": host, "ip": ip, "action": "skipped", "reason": "already in hosts file"})
         return
 
+    listen = _require_served()
     plan = f"append `{ip} {host}` to {GATEWAY_DNS_HOSTS} on {GATEWAY_HOST} + reload dnsmasq"
     if dry_run:
         emit({"host": host, "ip": ip, "action": "dry-run", "plan": plan})
@@ -1073,8 +1130,13 @@ def dns(
     ssh_run(GATEWAY_HOST, "sh", "-c",
             f"echo {shlex.quote(f'{ip} {host}')} >> {shlex.quote(GATEWAY_DNS_HOSTS)} && "
             f"chmod 644 {shlex.quote(GATEWAY_DNS_HOSTS)}")
-    ssh_run(GATEWAY_HOST, "sudo", "systemctl", "reload", "dnsmasq")
-    emit({"host": host, "ip": ip, "action": "added"})
+    _dnsmasq_reload()
+    answer = _dnsmasq_answer(host, listen)
+    if answer is not None and ip not in answer:
+        fail("record written but not served",
+             why=f"dig @{listen} {host} returned {', '.join(answer) or 'nothing'} after reloading dnsmasq",
+             hint="check that dnsmasq reloaded cleanly: journalctl -u dnsmasq on the gateway")
+    emit({"host": host, "ip": ip, "action": "added", "verified": answer is not None})
 
 
 # ── caddy ───────────────────────────────────────────────────────

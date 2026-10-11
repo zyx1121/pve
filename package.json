@@ -1,12 +1,12 @@
 {
   "name": "@zyx1121/pve",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "bun run scripts/build.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test && uv run tests/test_config.py && uv run tests/test_pve_persist.py",
+    "test": "bun test && uv run tests/test_config.py && uv run tests/test_pve_persist.py && uv run tests/test_dns_config.py",
     "check": "bun run build && bun run typecheck && bun run test"
   },
   "devDependencies": {

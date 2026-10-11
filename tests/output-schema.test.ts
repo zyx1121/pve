@@ -25,6 +25,7 @@ const SAMPLES: Record<string, unknown> = {
   pve_list_dns: {
     records: [{ ip: "10.0.0.1", host: "example.internal" }],
     hosts_file: "/example/gateway/dns/hosts",
+    served: true,
   },
   pve_list_caddy: {
     domains: ["example.test"],
