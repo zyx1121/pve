@@ -1,76 +1,107 @@
-# PVE
+<div align="center">
 
-供 Codex 與 Claude Code 使用的 Proxmox／gateway MCP plugin。
-從 zyx1121/plugin 的 utils 拆出，提供原有 16 個 PVE tools：
+<h1>PVE</h1>
 
-- 查詢、建立、啟動、停止與刪除 VM／LXC。
-- 管理主機 port forwarding。
-- 管理 gateway dnsmasq 的**內部 DNS**。
-- 管理 Caddy 站點，包含 diff 預覽、驗證與 reload 失敗回復。
+<p><strong>Proxmox guests, port forwards, internal DNS and Caddy sites as MCP tools.</strong></p>
 
-透過自然語言要求 agent 操作，例如「列出目前的 VM」或「查看 book-prod 狀態」。
-本 plugin 只有 MCP 與底層 scripts；工具 schema 是參數與操作語意的來源，
-不另維護一份 skill 工具手冊。FDE 可在部署流程中組合使用這些工具。
+[![CI](https://img.shields.io/github/actions/workflow/status/zyx1121/pve/check.yml?branch=main&style=flat-square&label=CI)](https://github.com/zyx1121/pve/actions)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-D97757?style=flat-square)](https://github.com/zyx1121/marketplace)
+[![License](https://img.shields.io/github/license/zyx1121/pve?style=flat-square)](LICENSE)
 
-## 安裝與設定
+**English** | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
-請 agent 從 `zyx1121/marketplace` 安裝 `pve@zyx1121`。
+</div>
 
-```sh
-# Claude Code
-claude plugin marketplace add zyx1121/marketplace
-claude plugin install pve@zyx1121
-
-# Codex
-codex plugin marketplace add zyx1121/marketplace
-codex plugin add pve@zyx1121
+```console
+$ pve_add_dns { "host": "dnscheck.internal", "ip": "10.10.10.250", "yes": true }
+{"host": "dnscheck.internal", "ip": "10.10.10.250", "action": "added", "verified": true}
 ```
 
-需要 Bun 1.3.13+、uv、SSH，以及 Python 3.11+（uv 可管理）。
-MCP 已打包，不需在安裝目錄執行 bun install；
-uv 在首次操作時依 scripts 的 PEP 723 宣告取得 Python 套件。
+A single-node Proxmox lab with a gateway runs on many small chores: guests, port forwards, internal DNS records and reverse-proxy sites. This plugin gives Codex and Claude Code 16 tools for them over SSH. Each tool that changes something needs an explicit confirmation.
 
-請 agent 依 [範例](examples/pve.config.example.json) 建立
-`~/.config/pve/config.json`（建議權限 0600），填入現有環境設定。
-也支援 XDG_CONFIG_HOME 與 PVE_CONFIG_PATH。SSH 主機、使用者及金鑰仍由
-SSH config 管理；gateway 的 secrets 留在 gateway。Plugin 升級不覆寫 profile。
+## Features
 
-[設定載入器](lib/_config.py) 的 FIELDS 定義環境變數對應；
-`PVE_<suffix>` 優先於舊的 `UTILS_PVE_<suffix>`，再優先於 profile。
-所有操作都使用同一份設定。缺少設定時回傳 setup 錯誤，不會使用某個私人網段。
+- **Manages guests**: lists, inspects, starts, stops, clones and destroys VMs and containers. A destroy also removes the guest's forwards, DNS records, Caddy sites and SSH alias.
+- **Forwards ports**: adds and removes iptables DNAT rules on the host and keeps them across reboots.
+- **Edits internal DNS**: adds and removes `*.internal` records in the gateway's dnsmasq, then verifies each change with dnsmasq.
+- **Edits Caddy sites**: previews the diff, runs `caddy validate`, reloads Caddy and rolls back when the reload fails.
 
-## 操作範圍
+## Quick start
 
-保留原有 yes／confirm 參數。停止是強制斷電；刪除會連帶清理資源，
-工具描述會列出影響。安裝 plugin 不代表授權任意修改基礎設施。
+```sh
+claude plugin marketplace add zyx1121/marketplace
+claude plugin install pve@zyx1121
+```
 
-DNS tools 只管理內部 dnsmasq，不會設定 Cloudflare 公網 DNS。
-Provisioning 沿用既有單節點、IPv4 /24、VMID／SSH port 與 firewall group
-慣例；這不是任意 Proxmox cluster 的通用管理套件。Profile 中的 template、
-bridge、firewall group 與 gateway 服務必須先存在。
+Codex: `codex plugin marketplace add zyx1121/marketplace`, then `codex plugin add pve@zyx1121`.
 
-Caddy 操作沿用既有驗證、備份與 reload／rollback 實作。
-MCP 呼叫有 120 秒期限；逾時後先查遠端狀態再決定是否重試，
-不代表遠端操作已回滾。正式環境的可用性操作仍依使用者指示執行。
+Copy [examples/pve.config.example.json](examples/pve.config.example.json) to `~/.config/pve/config.json` (mode 600), and set your host aliases, gateway paths and template IDs. Start a new session and ask "List my VMs".
 
-## 從 zyx 遷移
+The plugin needs Bun 1.3.13 or later, uv, SSH, and Python 3.11 or later. The MCP server ships bundled.
 
-安裝並驗證本 plugin 後，將 zyx 更新到移除 PVE 的版本。
-工具短名稱與參數保持相同；完整 MCP namespace 會由
-`plugin_zyx_utils` 改為 `plugin_pve_pve`，依 host 顯示為準。
-引用完整名稱的權限設定、hooks 或消費端需一併調整。
-其餘 utils 工具繼續由 zyx 提供，不要同時另註冊同名 pve server。
+## Usage
 
-## 維護
+| Area | Tools |
+|------|-------|
+| Guests | `pve_list_guests`, `pve_get_status`, `pve_start_guest`, `pve_stop_guest`, `pve_destroy_guest`, `pve_clone_vm`, `pve_create_ct` |
+| Port forwards | `pve_list_forwards`, `pve_add_forward`, `pve_remove_forward` |
+| Internal DNS | `pve_list_dns`, `pve_add_dns`, `pve_remove_dns` |
+| Caddy | `pve_list_caddy`, `pve_add_caddy`, `pve_remove_caddy` |
 
-`bun install --frozen-lockfile`，接著 `bun run check`。
-測試在本機假 SSH／暫存檔案上驗證參數、confirmation、錯誤 contract 與
-iptables persistence，不會改動真實 PVE。
+- Tools that change something need `yes` or `confirm`. `pve_stop_guest` cuts the power, and `pve_destroy_guest` cannot be undone.
+- The DNS tools manage the internal dnsmasq only, not public DNS.
+- A call has a 120-second limit. A timeout does not mean a rollback, so look at the remote state before you retry.
 
-Root plugin.json 與 mcp.json 是唯一 manifest 來源。Build 產生 Claude
-相容格式和 dist；生成檔一起提交，CI 檢查是否過期。
-發佈使用獨立版本，marketplace 固定到 release commit。
+## Configuration
 
-原始 PVE script、schemas、必要 helper 與 persistence test 來自
-[zyx1121/plugin@06270b0](https://github.com/zyx1121/plugin/tree/06270b0)，保留 MIT。
-本套件沒有對原 repo 的 runtime 依賴。
+`~/.config/pve/config.json` holds the profile. `PVE_CONFIG_PATH` and `XDG_CONFIG_HOME` move it.
+
+| Key | Sets |
+|-----|------|
+| `host`, `gateway` | SSH aliases of the Proxmox host and the gateway |
+| `gateway_ip` | gateway address on the guest bridge, which sets the subnet |
+| `gateway_dns`, `gateway_caddy`, `gateway_env` | the dnsmasq hosts file, the Caddyfile and the environment file on the gateway |
+| `caddy_reload` | the command that reloads Caddy |
+| `template`, `ct_template`, `bridge`, `fw_group`, `debian_mirror` | defaults for new guests |
+
+Each key also reads `PVE_<KEY>`, which wins over the older `UTILS_PVE_<KEY>`, which wins over the file. SSH config keeps the users and keys. Secrets stay on the gateway. Without a profile, the tools return a setup error instead of guessing a network.
+
+## How it works
+
+The Bun MCP server runs each call as a Python script under uv. The script works over SSH on the host or the gateway.
+
+- DNS edits fail before they write when dnsmasq does not read the configured hosts file. After a reload, the tools ask dnsmasq with `dig` and report `verified`.
+- The tools write the hosts file in place, so a symlinked file stays a symlink.
+- Port forwards persist to `/etc/iptables/rules.v4` without the rules that the SDN adds by itself.
+
+## Limits
+
+- One Proxmox node with an IPv4 /24 guest network, and the VMID, SSH port and firewall group conventions of this lab. It is not a general cluster manager.
+- The template, bridge, firewall group and gateway services in the profile must exist first.
+
+## For AI agents
+
+Facts for coding agents and LLM tools. The rules for changing the code are in [AGENTS.md](AGENTS.md).
+
+- **Summary**: Plugin with 16 MCP tools for a single-node Proxmox host and its gateway: guests, forwards, dnsmasq records and Caddy sites.
+- **Type**: plugin
+- **Interfaces**: MCP `pve` (stdio, `dist/server.js`). `scripts/pve.py` also runs as a CLI under uv.
+- **Install**: `claude plugin install pve@zyx1121`, after `claude plugin marketplace add zyx1121/marketplace`
+- **Run**: the host starts the MCP server
+- **Verify**: call `pve_list_guests`, or `pve_list_dns` and expect `served: true`
+- **Config**: `~/.config/pve/config.json`, `PVE_CONFIG_PATH`, and `PVE_<KEY>` for each profile key
+- **Secrets**: none in the plugin. SSH keys stay in SSH config, and gateway secrets stay on the gateway.
+- **Limits**: one node and one /24 guest network. Stop and destroy act at once after confirmation.
+
+## Development
+
+```sh
+bun install --frozen-lockfile
+bun run check
+```
+
+The tests use a fake SSH and temporary files, so they never touch a real host. `plugin.json` and `mcp.json` are the manifest sources. CI fails when the generated files are stale.
+
+## License
+
+[MIT](LICENSE)
