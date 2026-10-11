@@ -161,7 +161,7 @@ def node_status() -> dict:
         fail(
             "couldn't parse node status",
             why=f"expected 7 lines (uptime, loadavg, 4 meminfo fields, disk), got {len(lines)}",
-            hint="run `ssh pve 'cat /proc/uptime /proc/loadavg /proc/meminfo; df -B1 /'` to inspect",
+            hint=f"run `ssh {PVE_HOST} 'cat /proc/uptime /proc/loadavg /proc/meminfo; df -B1 /'` to inspect",
         )
 
     uptime_s = int(float(lines[0].split()[0]))
