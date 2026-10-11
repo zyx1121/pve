@@ -35324,7 +35324,7 @@ var pveTools = [
 var plugin_default = {
   $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   name: "pve",
-  version: "0.1.1",
+  version: "0.1.2",
   description: "Proxmox and gateway operations through MCP: guests, port forwards, internal DNS, and Caddy.",
   author: {
     name: "zyx1121",
