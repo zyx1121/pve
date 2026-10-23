@@ -9,8 +9,18 @@ const timeoutMs = 120000;
 const name = z.string().describe("VM/CT name or VMID.");
 const yes = z.literal(true).describe("Required explicit confirmation; passed as --yes to confirm-gated CLI commands.");
 const confirm = z.literal(true).describe("Required explicit confirmation.");
+const node = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/)
+  .optional()
+  .describe("Proxmox node from the profile's nodes (for example spawner or anvil). Omit for the profile's default_node. pve_list_guests reports the node names.");
 
-/** Everything here runs over SSH against the live homelab host. */
+/** A leading --node picks the profile node; pve.py reads it before parsing the command. */
+function onNode(input: { node?: string }, argv: string[]): string[] {
+  return input.node ? ["--node", input.node, ...argv] : argv;
+}
+
+/** Everything here runs over SSH against a live Proxmox node or the shared gateway. */
 const read = { readOnlyHint: true, openWorldHint: true } as const;
 const write = { readOnlyHint: false, destructiveHint: false, openWorldHint: true } as const;
 const destroy = { readOnlyHint: false, destructiveHint: true, openWorldHint: true } as const;
@@ -22,7 +32,7 @@ export const pveTools: ToolboxTool[] = [
   scriptTool({
     name: "pve_list_guests",
     description: "List PVE VMs and LXC containers with their run state. Cheapest way to resolve a guest name to a VMID before any other pve call.",
-    inputSchema: {},
+    inputSchema: { node },
     outputSchema: envelopeOutput(
       z.array(
         z.looseObject({
@@ -38,33 +48,33 @@ export const pveTools: ToolboxTool[] = [
     script,
     envelope,
     timeoutMs,
-    buildArgs: () => ["list"],
+    buildArgs: (input) => onNode(input, ["list"]),
   }),
   scriptTool({
     name: "pve_get_status",
     description: "Overall PVE status (node uptime/mem/disk + all guests) when name omitted; config and status for one guest when name given. Pass name to keep the response small.",
-    inputSchema: { name: name.optional() },
+    inputSchema: { node, name: name.optional() },
     annotations: read,
     script,
     envelope,
     timeoutMs,
     truncationHint: "pass name to scope the status to one guest",
-    buildArgs: (input) => (input.name ? ["status", input.name] : ["status"]),
+    buildArgs: (input) => onNode(input, (input.name ? ["status", input.name] : ["status"])),
   }),
   scriptTool({
     name: "pve_start_guest",
     description: "Start a stopped VM or LXC container. Starting an already-running guest is a no-op.",
-    inputSchema: { name },
+    inputSchema: { node, name },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     script,
     envelope,
     timeoutMs,
-    buildArgs: (input) => ["start", input.name],
+    buildArgs: (input) => onNode(input, ["start", input.name]),
   }),
   scriptTool({
     name: "pve_stop_guest",
     description: "Force-stop a running VM/container. This is a power cut, not a graceful shutdown, so in-flight writes can be lost. Destructive; pass yes=true to confirm.",
-    inputSchema: { name, yes },
+    inputSchema: { node, name, yes },
     annotations: destroy,
     script,
     envelope,
@@ -72,13 +82,13 @@ export const pveTools: ToolboxTool[] = [
     buildArgs: (input) => {
       const argv = ["stop", input.name];
       pushFlag(argv, "--yes", input.yes);
-      return argv;
+      return onNode(input, argv);
     },
   }),
   scriptTool({
     name: "pve_destroy_guest",
     description: "Permanently destroy a VM/container and cascade cleanup of its disks, forwards and DNS. Irreversible, no snapshot is taken; pass yes=true to confirm.",
-    inputSchema: { name, yes },
+    inputSchema: { node, name, yes },
     annotations: destroy,
     script,
     envelope,
@@ -86,13 +96,14 @@ export const pveTools: ToolboxTool[] = [
     buildArgs: (input) => {
       const argv = ["destroy", input.name];
       pushFlag(argv, "--yes", input.yes);
-      return argv;
+      return onNode(input, argv);
     },
   }),
   scriptTool({
     name: "pve_clone_vm",
     description: "Clone a new QEMU VM from a template, with optional forward/firewall setup. Confirm-gated. Prefer this over pve_create_ct when the workload runs Docker or needs its own kernel.",
     inputSchema: {
+      node,
       name: z.string().describe("New VM name."),
       ip: z.string().optional().describe("Internal IP."),
       template: z.number().optional().describe("Source template VMID."),
@@ -119,13 +130,14 @@ export const pveTools: ToolboxTool[] = [
       pushFlag(argv, "--no-forward", input.no_forward);
       pushFlag(argv, "--no-isolate", input.no_isolate);
       pushFlag(argv, "--yes", input.yes);
-      return argv;
+      return onNode(input, argv);
     },
   }),
   scriptTool({
     name: "pve_create_ct",
     description: "Create a new LXC container, with optional forward/firewall setup. Confirm-gated. Running Docker inside LXC needs nesting=true and stays fragile here, so prefer pve_clone_vm for container workloads.",
     inputSchema: {
+      node,
       name: z.string().describe("Container hostname."),
       template: z.string().optional().describe("vztmpl volid."),
       vmid: z.number().optional().describe("Target VMID."),
@@ -160,43 +172,43 @@ export const pveTools: ToolboxTool[] = [
       pushFlag(argv, "--no-forward", input.no_forward);
       pushFlag(argv, "--no-isolate", input.no_isolate);
       pushFlag(argv, "--yes", input.yes);
-      return argv;
+      return onNode(input, argv);
     },
   }),
   scriptTool({
     name: "pve_list_forwards",
-    description: "List PVE gateway port-forward rules as raw iptables lines. Read this first: pve_remove_forward addresses rules by line number.",
-    inputSchema: {},
+    description: "List a node's port-forward rules as raw iptables lines. Read this first: pve_remove_forward addresses rules by line number.",
+    inputSchema: { node },
     outputSchema: envelopeOutput(z.looseObject({ rules: z.array(z.string()) })),
     annotations: read,
     script,
     envelope,
     timeoutMs,
-    buildArgs: () => ["forward", "--action", "list"],
+    buildArgs: (input) => onNode(input, ["forward", "--action", "list"]),
   }),
   scriptTool({
     name: "pve_add_forward",
-    description: `Add HOST_PORT:VM_IP:VM_PORT port forward, exposing an internal service to the public internet. Requires confirm=true. ${rulesV4Trap}`,
-    inputSchema: { spec: z.string().describe("HOST_PORT:VM_IP:VM_PORT."), confirm },
+    description: `Add HOST_PORT:VM_IP:VM_PORT port forward, exposing an internal service to the public internet. Refused on a node with ssh_forward false. Requires confirm=true. ${rulesV4Trap}`,
+    inputSchema: { node, spec: z.string().describe("HOST_PORT:VM_IP:VM_PORT."), confirm },
     annotations: write,
     script,
     envelope,
     timeoutMs,
-    buildArgs: (input) => ["forward", input.spec, "--action", "add"],
+    buildArgs: (input) => onNode(input, ["forward", input.spec, "--action", "add"]),
   }),
   scriptTool({
     name: "pve_remove_forward",
     description: `Remove a PVE forward by iptables line number. Line numbers shift after every removal, so re-read pve_list_forwards between deletions. Destructive; requires confirm=true. ${rulesV4Trap}`,
-    inputSchema: { line: z.number().describe("Line number from pve_list_forwards."), confirm },
+    inputSchema: { node, line: z.number().describe("Line number from pve_list_forwards."), confirm },
     annotations: destroy,
     script,
     envelope,
     timeoutMs,
-    buildArgs: (input) => ["forward", "--action", "del", "--line", String(input.line)],
+    buildArgs: (input) => onNode(input, ["forward", "--action", "del", "--line", String(input.line)]),
   }),
   scriptTool({
     name: "pve_list_dns",
-    description: "List gateway dnsmasq internal DNS records.",
+    description: "List internal DNS records in the shared gateway's dnsmasq (one gateway for every node).",
     inputSchema: {},
     outputSchema: envelopeOutput(
       z.looseObject({

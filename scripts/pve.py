@@ -40,12 +40,25 @@ from _envelope import emit, fail  # noqa: E402
 
 from _config import load_config  # noqa: E402
 
+
+def _pop_node(argv: list[str]) -> Optional[str]:
+    """Take a leading `--node NAME` out of argv; the profile is read before typer parses.
+
+    Only the first argument counts, so a value later in the command is never taken for it."""
+    if len(argv) > 2 and argv[1] == "--node":
+        node = argv[2]
+        del argv[1:3]
+        return node
+    return None
+
+
 try:
-    _config = load_config()
+    _config = load_config(node=_pop_node(_sys.argv))
 except ValueError as error:
     fail("Invalid PVE configuration", why=str(error),
          hint="Configure the private profile using examples/pve.config.example.json.")
 
+NODE = _config["node"]
 PVE_HOST = _config["host"]
 GATEWAY_HOST = _config["gateway"]
 PVE_TEMPLATE = _config["template"]
@@ -58,6 +71,31 @@ CADDY_RELOAD_CMD = _config["caddy_reload"]
 VM_BRIDGE = _config["bridge"]
 # The firewall group and datacenter master switch must already exist.
 FW_GROUP = _config["fw_group"]
+# VMID = VMID_BASE + last octet of the guest IP: VMs from +100, containers from +200.
+VMID_BASE = _config["vmid_base"]
+# False for a node without a public address: no 50<vmid>:22 forwards, no iptables persistence.
+SSH_FORWARD = _config["ssh_forward"]
+_NO_FORWARD_HINT = f"node {NODE!r} has ssh_forward: false; reach its guests through the routed subnet instead"
+
+
+def _next_vmid(existing: set[int], start: int) -> int:
+    vmid = VMID_BASE + start
+    while vmid in existing:
+        vmid += 1
+    return vmid
+
+
+def _derive_ip(vmid: int, first: int) -> str:
+    """<subnet>.<vmid - VMID_BASE>, the convention that keeps a guest's IP readable from its VMID."""
+    octet = vmid - VMID_BASE
+    prefix_parts = GATEWAY_IP.split(".")
+    if len(prefix_parts) != 4 or not (1 <= octet <= 254):
+        fail(
+            f"can't auto-derive IP for VMID {vmid}",
+            why=f"node {NODE!r} uses <subnet>.<VMID - {VMID_BASE}> with that octet in 1-254 (GATEWAY_IP={GATEWAY_IP!r})",
+            hint=f"pass --ip explicitly or pick a VMID in {VMID_BASE + first}-{VMID_BASE + 254}",
+        )
+    return f"{'.'.join(prefix_parts[:3])}.{octet}"
 
 app = typer.Typer(
     rich_markup_mode=None,
@@ -610,7 +648,7 @@ def list_vms() -> None:
     def human(data, _meta):
         console.print(_guests_table(data))
 
-    emit(guests, {"count": len(guests), "host": PVE_HOST}, human=human)
+    emit(guests, {"count": len(guests), "node": NODE, "host": PVE_HOST, "nodes": _config["nodes"]}, human=human)
 
 
 # ── status ──────────────────────────────────────────────────────
@@ -633,7 +671,7 @@ def status(name: Optional[str] = typer.Argument(None, help="VM/CT name or VMID; 
             console.print(f"  disk {n['disk_used_gb']}/{n['disk_total_gb']}GB used")
             console.print(_guests_table(data["guests"]))
 
-        emit({"node": node, "guests": guests}, {"host": PVE_HOST, "count": len(guests)}, human=human)
+        emit({"node": node, "guests": guests}, {"node": NODE, "host": PVE_HOST, "nodes": _config["nodes"], "count": len(guests)}, human=human)
         return
 
     vm = find_guest(name)
@@ -664,7 +702,7 @@ def start(name: str = typer.Argument(..., help="VM/CT name or VMID")) -> None:
     vm = find_guest(name)
     cli = "pct" if vm["type"] == "lxc" else "qm"
     ssh_run(PVE_HOST, cli, "start", str(vm["vmid"]))
-    emit({"vmid": vm["vmid"], "name": vm["name"], "type": vm["type"], "action": "start"})
+    emit({"node": NODE, "vmid": vm["vmid"], "name": vm["name"], "type": vm["type"], "action": "start"})
 
 
 @app.command(help="Stop a VM or container.")
@@ -677,7 +715,7 @@ def stop(
     if not yes and not typer.confirm(f"stop {vm['type']} {vm['name']!r} (VMID {vm['vmid']})?"):
         fail("aborted", why="user did not confirm", hint="pass --yes to skip")
     ssh_run(PVE_HOST, cli, "stop", str(vm["vmid"]))
-    emit({"vmid": vm["vmid"], "name": vm["name"], "type": vm["type"], "action": "stop"})
+    emit({"node": NODE, "vmid": vm["vmid"], "name": vm["name"], "type": vm["type"], "action": "stop"})
 
 
 # ── destroy ─────────────────────────────────────────────────────
@@ -690,7 +728,7 @@ def destroy(
     cli = "pct" if vm["type"] == "lxc" else "qm"
     vm_ip = _vm_ip(vm["vmid"], vm["type"])
 
-    forwards = _find_forwards_to_ip(vm_ip) if vm_ip else []
+    forwards = _find_forwards_to_ip(vm_ip) if vm_ip and SSH_FORWARD else []
     ssh_forward_port = next((f["dport"] for f in forwards if f["target_port"] == 22), None)
     dns_records = _find_dns_records_by_ip(vm_ip) if vm_ip else []
     caddy_domains = _find_caddy_domains_by_ip(vm_ip) if vm_ip else []
@@ -773,6 +811,7 @@ def destroy(
     cleaned = _clean_known_hosts(targets)
 
     emit({
+        "node": NODE,
         "vmid": vm["vmid"],
         "name": vm["name"],
         "ip": vm_ip,
@@ -807,13 +846,34 @@ def ssh_cmd(
     raise typer.Exit(result.returncode)
 
 
+def _ssh_alias(name: str, ip: str, forward_port: Optional[int], user: str) -> dict:
+    """SSH alias advice for a new guest: through the host's port forward, or straight to the routed IP."""
+    if forward_port:
+        block = f"Host {name}\n  Port {forward_port}"
+        note = (f"add the ssh_alias_block to ~/.ssh/config, then add `{name}` to the shared "
+                f"per-VM `Host a b c ...` block (HostName = PVE external IP, User, IdentityFile)")
+    else:
+        block = f"Host {name}\n  HostName {ip}\n  User {user}"
+        note = (f"add the ssh_alias_block to ~/.ssh/config; {ip} is reached through the subnet "
+                f"route of node {NODE!r} (for example a Tailscale subnet router)")
+    return {
+        "ssh_alias_block": block,
+        "ssh_alias_note": note,
+        "next_steps": [
+            "edit ~/.ssh/config per ssh_alias_block + ssh_alias_note",
+            f"call pve_add_dns with host={name}.internal, ip={ip}, yes=true after authorization",
+            f"ssh -o StrictHostKeyChecking=accept-new {name} echo ok   # smoke test",
+        ],
+    }
+
+
 # ── clone ───────────────────────────────────────────────────────
 @app.command(help="Clone from template, set IP + auto-add 50<vmid>:22 SSH forward; prints SSH alias to add.")
 def clone(
     name: str = typer.Argument(..., help="New VM name"),
     ip: Optional[str] = typer.Option(None, "--ip", help="Internal IP (default: <subnet>.<VMID>, derived from the profile gateway_ip)"),
     template: int = typer.Option(PVE_TEMPLATE, "--template", help="Source template VMID"),
-    vmid: Optional[int] = typer.Option(None, "--vmid", help="Target VMID (default: next free ≥100)"),
+    vmid: Optional[int] = typer.Option(None, "--vmid", help="Target VMID (default: next free from the node's vmid_base + 100)"),
     cores: Optional[int] = typer.Option(None, "--cores", help="Override template cores"),
     ram: Optional[int] = typer.Option(None, "--ram", help="Override template RAM (MB)"),
     disk: Optional[int] = typer.Option(None, "--disk", help="Resize scsi0 to N GB (must be ≥ template size)"),
@@ -827,25 +887,16 @@ def clone(
             fail(f"VMID {vmid} already in use", hint="call `pve_list_guests` to see allocated IDs")
         new_vmid = vmid
     else:
-        new_vmid = 100
-        while new_vmid in existing:
-            new_vmid += 1
+        new_vmid = _next_vmid(existing, 100)
 
     if ip is None:
-        prefix_parts = GATEWAY_IP.split(".")
-        if len(prefix_parts) != 4 or not (1 <= new_vmid <= 254):
-            fail(
-                f"can't auto-derive IP for VMID {new_vmid}",
-                why=f"convention is <subnet>.<VMID> with VMID in 1-254 and a v4 subnet (GATEWAY_IP={GATEWAY_IP!r})",
-                hint="pass --ip explicitly or pick a VMID in 100-254",
-            )
-        ip = f"{'.'.join(prefix_parts[:3])}.{new_vmid}"
+        ip = _derive_ip(new_vmid, 100)
 
     forward_port = 50000 + new_vmid
-    add_forward = not no_forward and 1 <= forward_port <= 65535
+    add_forward = SSH_FORWARD and not no_forward and 1 <= forward_port <= 65535
     isolate = not no_isolate and bool(FW_GROUP)
 
-    plan = f"clone template {template} → VMID {new_vmid} as {name!r}, IP {ip}/24, gw {GATEWAY_IP}, bridge {VM_BRIDGE}"
+    plan = f"[{NODE}] clone template {template} → VMID {new_vmid} as {name!r}, IP {ip}/24, gw {GATEWAY_IP}, bridge {VM_BRIDGE}"
     if cores:
         plan += f", cores {cores}"
     if ram:
@@ -885,6 +936,7 @@ def clone(
         _persist_iptables()
 
     emit({
+        "node": NODE,
         "vmid": new_vmid,
         "name": name,
         "ip": ip,
@@ -895,16 +947,7 @@ def clone(
         "ram_mb": ram,
         "disk_gb": disk,
         "ssh_forward_port": forward_port if add_forward else None,
-        "ssh_alias_block": f"Host {name}\n  Port {forward_port}" if add_forward else None,
-        "ssh_alias_note": (
-            f"add the ssh_alias_block to ~/.ssh/config, then add `{name}` to the shared "
-            f"per-VM `Host a b c ...` block (HostName = PVE external IP, User, IdentityFile)"
-        ) if add_forward else None,
-        "next_steps": [
-            *( ["edit ~/.ssh/config per ssh_alias_block + ssh_alias_note"] if add_forward else [] ),
-            f"call pve_add_dns with host={name}.internal, ip={ip}, yes=true after authorization",
-            f"ssh -o StrictHostKeyChecking=accept-new {name} echo ok   # smoke test",
-        ],
+        **_ssh_alias(name, ip, forward_port if add_forward else None, "user"),
     })
 
 
@@ -917,7 +960,7 @@ _DEBIAN_MIRROR_URI = _config["debian_mirror"]
 def create_ct(
     name: str = typer.Argument(..., help="Hostname for the new container"),
     template: str = typer.Option(_CT_TEMPLATE_DEFAULT, "--template", help="vztmpl volid (default: debian-13-standard)"),
-    vmid: Optional[int] = typer.Option(None, "--vmid", help="Target VMID (default: next free ≥200)"),
+    vmid: Optional[int] = typer.Option(None, "--vmid", help="Target VMID (default: next free from the node's vmid_base + 200)"),
     ip: Optional[str] = typer.Option(None, "--ip", help="Internal IP (default: <subnet>.<VMID>)"),
     cores: int = typer.Option(2, "--cores", help="Number of CPU cores"),
     ram: int = typer.Option(2048, "--ram", help="RAM in MB"),
@@ -939,28 +982,19 @@ def create_ct(
             fail(f"VMID {vmid} already in use", hint="call `pve_list_guests` to see allocated IDs")
         new_vmid = vmid
     else:
-        # LXC lives in the 2xx segment (200-299).
-        new_vmid = 200
-        while new_vmid in existing_ids:
-            new_vmid += 1
+        # LXC lives in the 2xx segment of the node (vmid_base + 200-254).
+        new_vmid = _next_vmid(existing_ids, 200)
 
     if ip is None:
-        prefix_parts = GATEWAY_IP.split(".")
-        if len(prefix_parts) != 4 or not (1 <= new_vmid <= 254):
-            fail(
-                f"can't auto-derive IP for VMID {new_vmid}",
-                why=f"convention is <subnet>.<VMID> with VMID in 1-254 (GATEWAY_IP={GATEWAY_IP!r})",
-                hint="pass --ip explicitly or pick a VMID in 200-254",
-            )
-        ip = f"{'.'.join(prefix_parts[:3])}.{new_vmid}"
+        ip = _derive_ip(new_vmid, 200)
 
     forward_port = 50000 + new_vmid
-    add_forward = not no_forward and 1 <= forward_port <= 65535
+    add_forward = SSH_FORWARD and not no_forward and 1 <= forward_port <= 65535
     isolate = not no_isolate and bool(FW_GROUP)
     unpriv_flag = 1 if unprivileged else 0
 
     plan = (
-        f"create-ct VMID {new_vmid} as {name!r}, template {template}, "
+        f"[{NODE}] create-ct VMID {new_vmid} as {name!r}, template {template}, "
         f"IP {ip}/24, gw {GATEWAY_IP}, bridge {VM_BRIDGE}, "
         f"cores {cores}, RAM {ram}MB, disk {disk}GB, swap {swap}MB, "
         f"{'unprivileged' if unprivileged else 'privileged'}"
@@ -1043,6 +1077,7 @@ def create_ct(
         _persist_iptables()
 
     emit({
+        "node": NODE,
         "vmid": new_vmid,
         "name": name,
         "type": "lxc",
@@ -1058,16 +1093,7 @@ def create_ct(
         "isolated": isolate,
         "firewall_group": FW_GROUP if isolate else None,
         "ssh_forward_port": forward_port if add_forward else None,
-        "ssh_alias_block": f"Host {name}\n  Port {forward_port}" if add_forward else None,
-        "ssh_alias_note": (
-            f"add the ssh_alias_block to ~/.ssh/config, then add `{name}` to the shared "
-            f"per-VM `Host a b c ...` block (HostName = PVE external IP, User, IdentityFile)"
-        ) if add_forward else None,
-        "next_steps": [
-            *( ["edit ~/.ssh/config per ssh_alias_block + ssh_alias_note"] if add_forward else [] ),
-            f"call pve_add_dns with host={name}.internal, ip={ip}, yes=true after authorization",
-            f"ssh -o StrictHostKeyChecking=accept-new {name} echo ok   # smoke test (sshd present in debian-13-standard)",
-        ],
+        **_ssh_alias(name, ip, forward_port if add_forward else None, "root"),
     })
 
 
@@ -1080,15 +1106,18 @@ def forward(
 ) -> None:
     if action == "list":
         out = ssh_run(PVE_HOST, "iptables", "-t", "nat", "-L", "PREROUTING", "-n", "--line-numbers")
-        emit({"rules": out.splitlines()})
+        emit({"node": NODE, "rules": out.splitlines()})
         return
+
+    if not SSH_FORWARD:
+        fail(f"node {NODE!r} does not take port forwards", hint=_NO_FORWARD_HINT)
 
     if action == "del":
         if line is None:
             fail("--line required for del", hint="call `pve_list_forwards` to find the line number")
         ssh_run(PVE_HOST, "iptables", "-t", "nat", "-D", "PREROUTING", str(line))
         _persist_iptables()
-        emit({"action": "del", "line": line})
+        emit({"node": NODE, "action": "del", "line": line})
         return
 
     if action != "add":
@@ -1107,7 +1136,7 @@ def forward(
         "-j", "DNAT", "--to", f"{vm_ip}:{vm_port}",
     )
     _persist_iptables()
-    emit({"action": "add", "host_port": int(host_port), "vm_ip": vm_ip, "vm_port": int(vm_port)})
+    emit({"node": NODE, "action": "add", "host_port": int(host_port), "vm_ip": vm_ip, "vm_port": int(vm_port)})
 
 
 # ── dns ─────────────────────────────────────────────────────────

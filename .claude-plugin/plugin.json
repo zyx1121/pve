@@ -1,6 +1,6 @@
 {
   "name": "pve",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Proxmox and gateway operations through MCP: guests, port forwards, internal DNS, and Caddy.",
   "author": {
     "name": "zyx1121",

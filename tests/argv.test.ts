@@ -77,6 +77,21 @@ describe("PVE argv compatibility", () => {
     expect((await runCaptured("pve_remove_forward", { line: 4, confirm: true })).argv).toEqual(["forward", "--action", "del", "--line", "4"]);
   });
 
+  test("node leads the argv of guest and forward tools", async () => {
+    expect((await runCaptured("pve_list_guests", { node: "pve2" })).argv).toEqual(["--node", "pve2", "list"]);
+    expect((await runCaptured("pve_clone_vm", { node: "pve2", name: "web", yes: true })).argv).toEqual(["--node", "pve2", "clone", "web", "--yes"]);
+    expect((await runCaptured("pve_remove_forward", { node: "pve2", line: 4, confirm: true })).argv).toEqual(["--node", "pve2", "forward", "--action", "del", "--line", "4"]);
+    expect((await runCaptured("pve_get_status", {})).argv).toEqual(["status"]);
+  });
+
+  test("gateway tools take no node, and a node name cannot carry flags", async () => {
+    for (const name of ["pve_list_dns", "pve_add_dns", "pve_remove_dns", "pve_list_caddy", "pve_add_caddy", "pve_remove_caddy"]) {
+      expect("node" in getTool(name).inputSchema).toBe(false);
+    }
+    await expectRejected("pve_list_guests", { node: "--yes" });
+    await expectRejected("pve_list_guests", { node: "a b" });
+  });
+
   test("all confirm-gated operations reject missing or false confirmation", async () => {
     for (const tool of pveTools) {
       const gate = "yes" in tool.inputSchema ? "yes" : "confirm" in tool.inputSchema ? "confirm" : undefined;
