@@ -1,15 +1,33 @@
 {
-  "version": 1,
-  "host": "pve",
+  "version": 2,
   "gateway": "gateway",
-  "template": 9000,
-  "gateway_ip": "192.0.2.1",
   "gateway_dns": "/srv/gateway/dns/hosts",
   "gateway_caddy": "/srv/gateway/Caddyfile",
   "gateway_env": "/srv/gateway/.env",
   "caddy_reload": "sudo systemctl reload caddy",
-  "bridge": "vmbr1",
-  "fw_group": "spoke",
-  "ct_template": "local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst",
-  "debian_mirror": "https://deb.debian.org/debian"
+  "default_node": "pve",
+  "nodes": {
+    "pve": {
+      "host": "pve",
+      "template": 9000,
+      "gateway_ip": "192.0.2.1",
+      "bridge": "vmbr1",
+      "fw_group": "spoke",
+      "ct_template": "local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst",
+      "debian_mirror": "https://deb.debian.org/debian",
+      "vmid_base": 0,
+      "ssh_forward": true
+    },
+    "pve2": {
+      "host": "pve2",
+      "template": 1900,
+      "gateway_ip": "198.51.100.1",
+      "bridge": "vmbr1",
+      "fw_group": "spoke",
+      "ct_template": "local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst",
+      "debian_mirror": "https://deb.debian.org/debian",
+      "vmid_base": 1000,
+      "ssh_forward": false
+    }
+  }
 }

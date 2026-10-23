@@ -19,7 +19,7 @@ $ pve_add_dns { "host": "dnscheck.internal", "ip": "10.10.10.250", "yes": true }
 {"host": "dnscheck.internal", "ip": "10.10.10.250", "action": "added", "verified": true}
 ```
 
-單節點的 Proxmox 實驗環境加上一台 gateway，日常有很多小事：開 guest、設 port forwarding、加內部 DNS、設反向代理。這個 plugin 透過 SSH 給 Codex 和 Claude Code 16 個工具，所有會改東西的工具都要明確確認。
+幾台獨立的 Proxmox 節點加上一台共用的 gateway，日常有很多小事：開 guest、設 port forwarding、加內部 DNS、設反向代理。這個 plugin 透過 SSH 給 Codex 和 Claude Code 16 個工具，所有會改東西的工具都要明確確認。
 
 ## 功能
 
@@ -58,15 +58,20 @@ Codex：先 `codex plugin marketplace add zyx1121/marketplace`，再 `codex plug
 
 設定檔是 `~/.config/pve/config.json`，可以用 `PVE_CONFIG_PATH` 或 `XDG_CONFIG_HOME` 改位置。
 
-| 欄位 | 作用 |
-|------|------|
-| `host`、`gateway` | Proxmox 主機和 gateway 的 SSH alias |
-| `gateway_ip` | gateway 在 guest 網橋上的位址，決定網段 |
-| `gateway_dns`、`gateway_caddy`、`gateway_env` | gateway 上的 dnsmasq hosts 檔、Caddyfile 和環境變數檔 |
-| `caddy_reload` | 重新載入 Caddy 的指令 |
-| `template`、`ct_template`、`bridge`、`fw_group`、`debian_mirror` | 新 guest 的預設值 |
+設定檔是 `version: 2`：共用的 gateway 放在最上層，每個 Proxmox 節點一筆放在 `nodes` 底下。呼叫沒帶 `node` 時，用 `default_node` 指定的節點。
 
-每個欄位也會讀 `PVE_<KEY>`，它優先於舊的 `UTILS_PVE_<KEY>`，再優先於設定檔。使用者和金鑰由 SSH config 管理，機密留在 gateway 上。沒有設定檔時，工具會回傳設定錯誤，不會自己猜網段。
+| 欄位 | 位置 | 作用 |
+|------|------|------|
+| `gateway` | 最上層 | gateway 的 SSH alias |
+| `gateway_dns`、`gateway_caddy`、`gateway_env` | 最上層 | gateway 上的 dnsmasq hosts 檔、Caddyfile 和環境變數檔 |
+| `caddy_reload` | 最上層 | 重新載入 Caddy 的指令 |
+| `host` | 節點 | Proxmox 節點的 SSH alias |
+| `gateway_ip` | 節點 | 節點 guest 網段的閘道位址，決定 /24 網段 |
+| `template`、`ct_template`、`bridge`、`fw_group`、`debian_mirror` | 節點 | 新 guest 的預設值 |
+| `vmid_base` | 節點 | 加在每個 VMID 上的 1000 的倍數（預設 `0`）。VM 從 `vmid_base + 100` 起，container 從 `vmid_base + 200` 起，IP 最後一碼是 `VMID - vmid_base`。 |
+| `ssh_forward` | 節點 | `true` 時每個新 guest 在節點上加一條 `50<VMID>:22` 轉發（預設）。沒有公網位址的節點設 `false`：guest 走路由網段連線，轉發工具會拒絕修改。 |
+
+guest 和轉發工具可以帶 `node`，DNS 和 Caddy 工具作用在共用的 gateway。每個欄位也會讀 `PVE_<KEY>`，它優先於舊的 `UTILS_PVE_<KEY>`，再優先於設定檔。呼叫沒指定節點時，`PVE_NODE` 決定節點。使用者和金鑰由 SSH config 管理，機密留在 gateway 上。沒有設定檔時，工具會回傳設定錯誤，不會自己猜網段。
 
 ## 運作方式
 
@@ -78,7 +83,7 @@ Bun 的 MCP server 把每次呼叫交給 uv 執行一支 Python 腳本，腳本�
 
 ## 限制
 
-- 只支援一個 Proxmox 節點、一個 IPv4 /24 的 guest 網段，以及這個實驗環境的 VMID、SSH port 和防火牆群組慣例。它不是通用的 cluster 管理工具。
+- 支援幾台獨立的 Proxmox 節點，每台一個 IPv4 /24 的 guest 網段，以及這個實驗環境的 VMID、SSH port 和防火牆群組慣例。它不管 cluster，也不在節點間搬 guest。
 - 設定檔裡的 template、網橋、防火牆群組和 gateway 服務都要先存在。
 
 ## 其他

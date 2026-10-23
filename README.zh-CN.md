@@ -19,7 +19,7 @@ $ pve_add_dns { "host": "dnscheck.internal", "ip": "10.10.10.250", "yes": true }
 {"host": "dnscheck.internal", "ip": "10.10.10.250", "action": "added", "verified": true}
 ```
 
-单节点的 Proxmox 实验环境加上一台 gateway，日常有很多小事：开 guest、设端口转发、加内部 DNS、配反向代理。这个插件通过 SSH 给 Codex 和 Claude Code 16 个工具，所有会改动东西的工具都要明确确认。
+几台独立的 Proxmox 节点加上一台共用的 gateway，日常有很多小事：开 guest、设端口转发、加内部 DNS、配反向代理。这个插件通过 SSH 给 Codex 和 Claude Code 16 个工具，所有会改动东西的工具都要明确确认。
 
 ## 功能
 
@@ -58,15 +58,20 @@ Codex：先 `codex plugin marketplace add zyx1121/marketplace`，再 `codex plug
 
 配置文件是 `~/.config/pve/config.json`，可以用 `PVE_CONFIG_PATH` 或 `XDG_CONFIG_HOME` 改变位置。
 
-| 字段 | 作用 |
-|------|------|
-| `host`、`gateway` | Proxmox 主机和 gateway 的 SSH alias |
-| `gateway_ip` | gateway 在 guest 网桥上的地址，决定网段 |
-| `gateway_dns`、`gateway_caddy`、`gateway_env` | gateway 上的 dnsmasq hosts 文件、Caddyfile 和环境变量文件 |
-| `caddy_reload` | 重新加载 Caddy 的命令 |
-| `template`、`ct_template`、`bridge`、`fw_group`、`debian_mirror` | 新 guest 的默认值 |
+配置文件是 `version: 2`：共用的 gateway 放在最上层，每个 Proxmox 节点一条放在 `nodes` 下面。调用没带 `node` 时，使用 `default_node` 指定的节点。
 
-每个字段也会读取 `PVE_<KEY>`，它优先于旧的 `UTILS_PVE_<KEY>`，再优先于配置文件。用户和密钥由 SSH config 管理，机密留在 gateway 上。没有配置文件时，工具会返回配置错误，不会自己猜网段。
+| 字段 | 位置 | 作用 |
+|------|------|------|
+| `gateway` | 最上层 | gateway 的 SSH alias |
+| `gateway_dns`、`gateway_caddy`、`gateway_env` | 最上层 | gateway 上的 dnsmasq hosts 文件、Caddyfile 和环境变量文件 |
+| `caddy_reload` | 最上层 | 重新加载 Caddy 的命令 |
+| `host` | 节点 | Proxmox 节点的 SSH alias |
+| `gateway_ip` | 节点 | 节点 guest 网段的网关地址，决定 /24 网段 |
+| `template`、`ct_template`、`bridge`、`fw_group`、`debian_mirror` | 节点 | 新 guest 的默认值 |
+| `vmid_base` | 节点 | 加在每个 VMID 上的 1000 的倍数（默认 `0`）。VM 从 `vmid_base + 100` 起，container 从 `vmid_base + 200` 起，IP 最后一段是 `VMID - vmid_base`。 |
+| `ssh_forward` | 节点 | `true` 时每个新 guest 在节点上加一条 `50<VMID>:22` 转发（默认）。没有公网地址的节点设 `false`：guest 通过路由网段连接，转发工具会拒绝修改。 |
+
+guest 和转发工具可以带 `node`，DNS 和 Caddy 工具作用在共用的 gateway。每个字段也会读取 `PVE_<KEY>`，它优先于旧的 `UTILS_PVE_<KEY>`，再优先于配置文件。调用没指定节点时，`PVE_NODE` 决定节点。用户和密钥由 SSH config 管理，机密留在 gateway 上。没有配置文件时，工具会返回配置错误，不会自己猜网段。
 
 ## 工作原理
 
@@ -78,7 +83,7 @@ Bun 的 MCP server 把每次调用交给 uv 运行一个 Python 脚本，脚本�
 
 ## 限制
 
-- 只支持一个 Proxmox 节点、一个 IPv4 /24 的 guest 网段，以及这个实验环境的 VMID、SSH 端口和防火墙组约定。它不是通用的集群管理工具。
+- 支持几台独立的 Proxmox 节点，每台一个 IPv4 /24 的 guest 网段，以及这个实验环境的 VMID、SSH 端口和防火墙组约定。它不管集群，也不在节点间迁移 guest。
 - 配置文件里的 template、网桥、防火墙组和 gateway 服务都要先存在。
 
 ## 其他

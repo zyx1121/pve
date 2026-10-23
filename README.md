@@ -17,7 +17,7 @@ $ pve_add_dns { "host": "dnscheck.internal", "ip": "10.10.10.250", "yes": true }
 {"host": "dnscheck.internal", "ip": "10.10.10.250", "action": "added", "verified": true}
 ```
 
-A single-node Proxmox lab with a gateway runs on many small chores: guests, port forwards, internal DNS records and reverse-proxy sites. This plugin gives Codex and Claude Code 16 tools for them over SSH. Each tool that changes something needs an explicit confirmation.
+A Proxmox lab with a few standalone nodes and one gateway runs on many small chores: guests, port forwards, internal DNS records and reverse-proxy sites. This plugin gives Codex and Claude Code 16 tools for them over SSH. Each tool that changes something needs an explicit confirmation.
 
 ## Features
 
@@ -56,15 +56,20 @@ The plugin needs Bun 1.3.13 or later, uv, SSH, and Python 3.11 or later. The MCP
 
 `~/.config/pve/config.json` holds the profile. `PVE_CONFIG_PATH` and `XDG_CONFIG_HOME` move it.
 
-| Key | Sets |
-|-----|------|
-| `host`, `gateway` | SSH aliases of the Proxmox host and the gateway |
-| `gateway_ip` | gateway address on the guest bridge, which sets the subnet |
-| `gateway_dns`, `gateway_caddy`, `gateway_env` | the dnsmasq hosts file, the Caddyfile and the environment file on the gateway |
-| `caddy_reload` | the command that reloads Caddy |
-| `template`, `ct_template`, `bridge`, `fw_group`, `debian_mirror` | defaults for new guests |
+The profile has `version: 2`, the shared gateway at the top level, and one entry per Proxmox node under `nodes`. `default_node` names the node that a call without `node` uses.
 
-Each key also reads `PVE_<KEY>`, which wins over the older `UTILS_PVE_<KEY>`, which wins over the file. SSH config keeps the users and keys. Secrets stay on the gateway. Without a profile, the tools return a setup error instead of guessing a network.
+| Key | Where | Sets |
+|-----|-------|------|
+| `gateway` | top level | SSH alias of the gateway |
+| `gateway_dns`, `gateway_caddy`, `gateway_env` | top level | the dnsmasq hosts file, the Caddyfile and the environment file on the gateway |
+| `caddy_reload` | top level | the command that reloads Caddy |
+| `host` | node | SSH alias of the Proxmox node |
+| `gateway_ip` | node | gateway address on the node's guest network, which sets the /24 subnet |
+| `template`, `ct_template`, `bridge`, `fw_group`, `debian_mirror` | node | defaults for new guests |
+| `vmid_base` | node | a multiple of 1000 added to every VMID (default `0`). VMs start at `vmid_base + 100`, containers at `vmid_base + 200`, and the last octet of the IP is `VMID - vmid_base`. |
+| `ssh_forward` | node | `true` adds a `50<VMID>:22` forward on the node for each new guest (default). Set `false` for a node without a public address. Its guests are reached through a routed subnet, and the forward tools refuse to change it. |
+
+Guest and forward tools take an optional `node`. DNS and Caddy tools act on the shared gateway. Each key also reads `PVE_<KEY>`, which wins over the older `UTILS_PVE_<KEY>`, which wins over the file. `PVE_NODE` picks the node when a call does not. SSH config keeps the users and keys. Secrets stay on the gateway. Without a profile, the tools return a setup error instead of guessing a network.
 
 ## How it works
 
@@ -76,22 +81,22 @@ The Bun MCP server runs each call as a Python script under uv. The script works 
 
 ## Limits
 
-- One Proxmox node with an IPv4 /24 guest network, and the VMID, SSH port and firewall group conventions of this lab. It is not a general cluster manager.
+- Standalone Proxmox nodes, each with one IPv4 /24 guest network, and the VMID, SSH port and firewall group conventions of this lab. It is not a cluster manager and does not move guests between nodes.
 - The template, bridge, firewall group and gateway services in the profile must exist first.
 
 ## For AI agents
 
 Facts for coding agents and LLM tools. The rules for changing the code are in [AGENTS.md](AGENTS.md).
 
-- **Summary**: Plugin with 16 MCP tools for a single-node Proxmox host and its gateway: guests, forwards, dnsmasq records and Caddy sites.
+- **Summary**: Plugin with 16 MCP tools for standalone Proxmox nodes and their shared gateway: guests, forwards, dnsmasq records and Caddy sites.
 - **Type**: plugin
 - **Interfaces**: MCP `pve` (stdio, `dist/server.js`). `scripts/pve.py` also runs as a CLI under uv.
 - **Install**: `claude plugin install pve@zyx1121`, after `claude plugin marketplace add zyx1121/marketplace`
 - **Run**: the host starts the MCP server
 - **Verify**: call `pve_list_guests`, or `pve_list_dns` and expect `served: true`
-- **Config**: `~/.config/pve/config.json`, `PVE_CONFIG_PATH`, and `PVE_<KEY>` for each profile key
+- **Config**: `~/.config/pve/config.json` (profile version 2), `PVE_CONFIG_PATH`, `PVE_NODE`, and `PVE_<KEY>` for each profile key
 - **Secrets**: none in the plugin. SSH keys stay in SSH config, and gateway secrets stay on the gateway.
-- **Limits**: one node and one /24 guest network. Stop and destroy act at once after confirmation.
+- **Limits**: one /24 guest network per node, no cluster operations. Stop and destroy act at once after confirmation.
 
 ## Development
 
